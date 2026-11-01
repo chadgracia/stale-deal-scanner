@@ -9,4 +9,8 @@
 - Pipeline date fields come back as `YYYY/MM/DD` on read (e.g. `2024/11/26 06:19:44 -0500`).
 - Every change must keep the safeguard: never send client emails unless state can be saved
   (`save_state` must succeed before notices go out; stop sending if a mid-run save fails).
-- Auto-obsolete is to be removed: the scanner must never move a deal to Obsolete going forward.
+- The daily scan (`run_scan`) is REPORT ONLY. Auto-obsolete and client removal notices have been removed:
+  it must never move a deal to Obsolete, never PUT to Pipeline, and never email a client. Its only email is
+  Chad's report ("Due for review" + "Heads-up"). Hold deals are skipped entirely.
+- Client reminders will be a separate future feature (`compose_email` is kept, unused, for it).
+- Tests: `python3 -m unittest discover tests` (fake S3/SES/Pipeline; asserts no PUTs and Chad-only email).

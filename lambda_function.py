@@ -3,23 +3,25 @@ stale_deal_scanner.py
 ─────────────────────
 Daily Lambda (EventBridge, 8 AM ET).
 
-Flow per active deal (Confirm / Firm / Inquiry / Hold):
-  clock start = later of Pipeline updated_at and Chad's last Reset click
-  1. HEADS-UP  — due within 7 days → listed in Chad's report with a Reset link
-  2. NOTICE    — due → client gets a removal notice (removal date = +3 days);
-                 deal is NOT moved yet. Max 25 notices per run.
-  3. OBSOLETE  — 3+ days after notice, only if the deal has not been edited
-                 since the notice (client form update, Chad edit, or Reset
-                 all cancel it) → moved to Obsolete, Refresh cleared.
+REPORT ONLY. The daily scan never changes a deal in Pipeline and never emails a
+client; its only output is Chad's report email. (Auto-obsolete and client removal
+notices were removed; client reminders will be a separate future feature.)
 
-State: s3://full-pipeline-cache/stale-scanner-state.json
+Flow per active deal (Confirm / Firm / Inquiry — Hold deals are skipped entirely):
+  clock start = later of Pipeline updated_at and Chad's last Reset click
+  1. DUE       — age >= refresh days → "Due for review" in Chad's report (oldest
+                 first) with a Reset link
+  2. HEADS-UP  — due within 7 days → listed in Chad's report with a Reset link
+
+State: s3://full-pipeline-cache/stale-scanner-state.json (reset_at / obsoleted_at).
+  Leftover noticed_at / updated_at_at_notice keys are stripped on every run.
   If state cannot be saved, the run stops before sending anything.
 
-Stage defaults (days):  Confirm=1, Firm=60, Inquiry=60, Hold=90
+Stage defaults (days):  Confirm=1, Firm=60, Inquiry=60 (Hold=90 used only by the Reset page)
 Refresh=0 → skip forever | Refresh=N → N days | blank → stage default
 
 Invocations:
-  EventBridge (no special keys)      → daily scan
+  EventBridge (no special keys)      → daily scan (report only)
   {"diagnose": true}                 → legacy diagnostic (unchanged)
   {"restore": "dry"}                 → list the Sep 23 2026 obsoleted deals, change nothing
   {"restore": "execute"}             → move them to Inquiry, Refresh = 90
@@ -614,13 +616,6 @@ def handle_web(event):
         cur = info["effective"]
         cur_lbl = (f"{info['refresh_days']} days (Refresh field)" if info["refresh_days"] is not None
                    else (f"{info['stage_default']} days ({e(info['stage'])} default)" if info["stage_default"] else "not scanned at this stage"))
-        pending = ""
-        if rec.get("noticed_at"):
-            try:
-                rm = datetime.fromisoformat(rec["noticed_at"]) + timedelta(days=GRACE_DAYS)
-                pending = f"<p style=\"background:#fff4e5;padding:8px 12px;border-radius:4px;\">Removal notice sent — scheduled for Obsolete on {fmt_day(rm)}.</p>"
-            except Exception:
-                pass
         opp_side = "buyers" if info["side"] == "Sell" else "sellers"
         opp = f"{info['opp_firm']} Firm {opp_side}"
         if info["opp_range"]:
@@ -667,7 +662,6 @@ def handle_web(event):
 <p style="margin-top:0;color:#666;">Deal {deal_id} ·
   <a href="https://trades.graciagroup.com/deal/{deal_id}" target="_blank">Deal page</a> ·
   <a href="https://app.pipelinecrm.com/deals/{deal_id}" target="_blank">Pipeline</a></p>
-{pending}
 <table style="border-collapse:collapse;font-size:14px;margin:12px 0 20px;">{table}</table>
 <form method="POST" action="">
   <input type="hidden" name="action" value="reset">
@@ -675,7 +669,7 @@ def handle_web(event):
   <input type="hidden" name="token" value="{e(token)}">
   <p style="margin-bottom:4px;"><b>Restart the clock with:</b></p>
   {radios}
-  <p style="font-size:13px;color:#666;">Any pending removal notice is cancelled. Choosing a different number also updates the Refresh field in Pipeline.</p>
+  <p style="font-size:13px;color:#666;">Choosing a different number also updates the Refresh field in Pipeline.</p>
   <button type="submit" style="background:#1a1a1a;color:#fff;border:0;padding:10px 20px;border-radius:4px;font-size:14px;cursor:pointer;">Reset clock</button>
 </form>""")
 
@@ -794,9 +788,10 @@ def lambda_handler(event, context):
 
 
 def run_scan():
+    """Report-only daily scan. Never changes a deal in Pipeline and never emails a client;
+    the only email it sends is Chad's report."""
     logger.info(f"Stale deal scanner started (DRY_RUN={DRY_RUN})")
     now = datetime.now(timezone.utc)
-    jwt = get_jwt()
 
     deals_data = load_json_from_s3(CACHE_BUCKET, "deals.json")
     all_deals  = deals_data.get("deals", [])
@@ -809,15 +804,21 @@ def run_scan():
     state = load_state()
     sd = state["deals"]
 
-    # Fail safe: never send notices unless we can record them.
+    # Fail safe: never send client emails unless state can be saved (kept for the future reminder feature).
     if not DRY_RUN and not save_state(state):
         send_email(CHAD_EMAIL, f"Stale Deal Scanner — ABORTED — {now.strftime('%Y-%m-%d')}",
                    "Could not write stale-scanner-state.json to full-pipeline-cache. "
                    "No notices sent and no deals changed. The scanner's IAM role needs s3:PutObject on that bucket.")
         return {"statusCode": 500, "error": "state not writable"}
 
+    # Old removal notices must never resume: strip their keys from every record.
+    for rec in sd.values():
+        if isinstance(rec, dict):
+            rec.pop("noticed_at", None)
+            rec.pop("updated_at_at_notice", None)
+
     active_ids = set()
-    headsup, to_notice, to_obsolete, pending = [], [], [], []
+    due, headsup = [], []
 
     for deal in all_deals:
         cf       = deal.get("custom_fields", {})
@@ -825,6 +826,9 @@ def run_scan():
         if stage_id not in STAGE_DEFAULTS:
             continue
         did = str(deal.get("id"))
+        if stage_id == 2094373:  # Hold — skipped completely
+            sd.pop(did, None)
+            continue
         active_ids.add(did)
         stage_name, stage_default_days = STAGE_DEFAULTS[stage_id]
         refresh_raw = parse_cf_value(cf, REFRESH_FIELD)
@@ -846,22 +850,6 @@ def run_scan():
         rec = sd.get(did, {})
         rec.pop("obsoleted_at", None)  # deal is active again (revived)
 
-        # Pending notice?
-        if rec.get("noticed_at"):
-            noticed_dt = datetime.fromisoformat(rec["noticed_at"])
-            if updated_str != rec.get("updated_at_at_notice"):
-                # Edited since notice (client form, Chad, anyone) → cancel removal
-                rec.pop("noticed_at", None)
-                rec.pop("updated_at_at_notice", None)
-            else:
-                remove_on = noticed_dt + timedelta(days=GRACE_DAYS)
-                if now >= remove_on:
-                    to_obsolete.append((stage_name, deal))
-                else:
-                    pending.append((remove_on, stage_name, deal))
-                sd[did] = rec
-                continue
-
         clock_start = updated_dt
         if rec.get("reset_at"):
             try:
@@ -872,7 +860,7 @@ def run_scan():
         due_on = clock_start + timedelta(days=refresh_days)
 
         if age >= refresh_days:
-            to_notice.append((age, stage_name, deal, updated_str))
+            due.append((age, stage_name, deal))
         elif (due_on - now).days < HEADSUP_DAYS:
             headsup.append((due_on, stage_name, deal))
 
@@ -890,79 +878,6 @@ def run_scan():
             continue
         sd.pop(did, None)
 
-    to_notice.sort(key=lambda x: x[0], reverse=True)
-
-    # ── Obsolete deals whose grace period expired ──
-    obsoleted_lines = []
-    for stage_name, deal in to_obsolete:
-        did = str(deal.get("id"))
-        name = deal.get("name", did)
-        if DRY_RUN:
-            obsoleted_lines.append(f"[DRY RUN] {name} (was {stage_name})")
-            continue
-        r = call_pipeline_api("PUT", f"/deals/{did}.json",
-                              {"deal": {"deal_stage_id": OBSOLETE_STAGE_ID,
-                                        "custom_fields": {REFRESH_FIELD: None}}}, jwt=jwt)
-        if r["status"] == 200:
-            sd[did] = {"obsoleted_at": now.isoformat()}
-            obsoleted_lines.append(f"{name} (was {stage_name})")
-        else:
-            obsoleted_lines.append(f"{name} — Obsolete FAILED ({r['status']}), will retry tomorrow")
-    if not DRY_RUN:
-        save_state(state)
-
-    # ── Send notices ──
-    noticed = []   # (name, did, email, remove_on)
-    no_email = []
-    deferred = 0
-    remove_on = now + timedelta(days=GRACE_DAYS)
-    for age, stage_name, deal, updated_str in to_notice:
-        if len(noticed) >= MAX_NOTICES_PER_RUN:
-            deferred += 1
-            continue
-        did  = str(deal.get("id"))
-        name = deal.get("name", did)
-        contact    = deal.get("primary_contact") or {}
-        contact_id = contact.get("id") or deal.get("primary_contact_id")
-        contact_name  = contact.get("full_name", "")
-        contact_email = ""
-        if contact_id:
-            pr = call_pipeline_api("GET", f"/people/{contact_id}.json", jwt=jwt)
-            if pr["status"] == 200 and isinstance(pr["data"], dict):
-                contact_email = (pr["data"].get("email") or "").strip()
-        if not contact_email:
-            no_email.append((name, did))
-            continue
-
-        try:
-            subject, body, body_html = compose_email(
-                deal, contact_name, contact_email, "", form_url(int(did)), age,
-                remove_on.strftime("%B %d, %Y").replace(" 0", " "))
-        except Exception as e:
-            logger.error(f"Bedrock error for deal {did}: {e}")
-            continue
-
-        if DRY_RUN:
-            noticed.append((f"[DRY RUN] {name}", did, contact_email, remove_on))
-            continue
-
-        actual = TEST_EMAIL_OVERRIDE or contact_email
-        if TEST_EMAIL_OVERRIDE:
-            body = f"[TEST — real recipient would be: {contact_email}]\n\n{body}"
-            body_html = f"<p style=\"background:#fffbe6;padding:8px;font-size:12px;\">[TEST — real recipient would be: {contact_email}]</p>" + body_html
-        try:
-            send_email(actual, subject, body, body_html, source=CLIENT_FROM, reply_to=REPLY_TO)
-        except Exception as e:
-            logger.error(f"SES error for deal {did}: {e}")
-            continue
-
-        sd[did] = {"noticed_at": now.isoformat(), "updated_at_at_notice": updated_str}
-        if not save_state(state):
-            logger.error("State save failed mid-run; stopping notices")
-            noticed.append((name, did, actual, remove_on))
-            break
-        noticed.append((name, did, actual, remove_on))
-
     # ── Report to Chad ──
     def link(did):
         u = reset_url(did)
@@ -974,34 +889,26 @@ def run_scan():
             return h + "<p style=\"color:#888;margin:0;\">(none)</p>"
         return h + "<ul style=\"margin:0;padding-left:18px;\">" + "".join(f"<li>{r}</li>" for r in rows) + "</ul>"
 
-    dry = " [DRY RUN — no emails to clients, no deals changed]" if DRY_RUN else ""
+    dry = " [DRY RUN — state not saved]" if DRY_RUN else ""
+    due.sort(key=lambda x: x[0], reverse=True)   # oldest first
     headsup.sort(key=lambda x: x[0])
-    pending.sort(key=lambda x: x[0])
 
-    h_obs  = [html.escape(x) for x in obsoleted_lines]
-    h_not  = [f"{html.escape(n)} → {html.escape(e)} (removal {fmt_day(r)}){link(d)}" for n, d, e, r in noticed]
-    h_pend = [f"{html.escape(d.get('name',''))} — removal {fmt_day(r)} ({s}){link(d.get('id'))}" for r, s, d in pending]
+    h_due  = [f"{html.escape(d.get('name',''))} — {s}, {a} days{link(d.get('id'))}" for a, s, d in due]
     h_head = [f"{html.escape(d.get('name',''))} — due {fmt_day(r)} ({s}){link(d.get('id'))}" for r, s, d in headsup]
-    h_noem = [f"{html.escape(n)} (id={d}) — no primary contact email" for n, d in no_email]
 
-    parts = [f"<p><b>Stale Deal Scanner — {now.strftime('%Y-%m-%d')}</b>{html.escape(dry)}</p>"]
+    parts = [f"<p><b>Stale Deal Scanner — {now.strftime('%Y-%m-%d')}</b>{html.escape(dry)}</p>",
+             "<p style=\"color:#888;\">Report only — the scanner no longer obsoletes deals or emails clients.</p>"]
     if not SCANNER_URL:
         parts.append("<p style=\"color:#b00;\">Reset links disabled: SCANNER_URL env var is blank.</p>")
-    parts.append(section(f"Moved to Obsolete — no update in {GRACE_DAYS} days after notice ({len(h_obs)})", h_obs))
-    parts.append(section(f"Removal notices sent today ({len(h_not)})", h_not))
-    if deferred:
-        parts.append(f"<p style=\"color:#888;\">{deferred} more due deals held for tomorrow (max {MAX_NOTICES_PER_RUN} notices per run).</p>")
-    parts.append(section(f"Pending removal — notice already sent ({len(h_pend)})", h_pend))
+    parts.append(section(f"Due for review ({len(h_due)})", h_due))
     parts.append(section(f"Heads-up — due in the next {HEADSUP_DAYS} days ({len(h_head)})", h_head))
-    if h_noem:
-        parts.append(section(f"Due but skipped ({len(h_noem)})", h_noem))
     report_html = "<html><body style=\"font-family:Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;\">" + "".join(parts) + "</body></html>"
 
-    plain = [f"Stale Deal Scanner — {now.strftime('%Y-%m-%d')}{dry}", "",
-             f"Moved to Obsolete ({len(obsoleted_lines)}):", *[f"  • {x}" for x in obsoleted_lines], "",
-             f"Notices sent ({len(noticed)}):", *[f"  • {n} → {e} (removal {fmt_day(r)})" for n, d, e, r in noticed], "",
-             f"Pending removal ({len(pending)}):", *[f"  • {d.get('name','')} — {fmt_day(r)}" for r, s, d in pending], "",
-             f"Heads-up ({len(headsup)}):", *[f"  • {d.get('name','')} — due {fmt_day(r)}" for r, s, d in headsup]]
+    plain = [f"Stale Deal Scanner — {now.strftime('%Y-%m-%d')}{dry}",
+             "Report only — the scanner no longer obsoletes deals or emails clients.", "",
+             f"Due for review ({len(due)}):", *[f"  • {d.get('name','')} — {s}, {a} days" for a, s, d in due], "",
+             f"Heads-up — due in the next {HEADSUP_DAYS} days ({len(headsup)}):",
+             *[f"  • {d.get('name','')} — due {fmt_day(r)}" for r, s, d in headsup]]
     try:
         send_email(CHAD_EMAIL,
                    f"{'DRY RUN — ' if DRY_RUN else ''}Stale Deal Scanner Report — {now.strftime('%Y-%m-%d')}",
@@ -1011,6 +918,5 @@ def run_scan():
 
     if not DRY_RUN:
         save_state(state)
-    logger.info(f"Done. obsoleted={len(obsoleted_lines)} noticed={len(noticed)} pending={len(pending)} headsup={len(headsup)}")
-    return {"statusCode": 200, "dry_run": DRY_RUN, "obsoleted": len(obsoleted_lines),
-            "noticed": len(noticed), "pending": len(pending), "headsup": len(headsup)}
+    logger.info(f"Done. due={len(due)} headsup={len(headsup)}")
+    return {"statusCode": 200, "dry_run": DRY_RUN, "due": len(due), "headsup": len(headsup)}
