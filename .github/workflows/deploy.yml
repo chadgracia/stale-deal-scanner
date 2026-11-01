@@ -1,0 +1,21 @@
+name: Deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::271378210266:role/github-actions-deploy
+          aws-region: us-east-1
+      - run: |
+          python3 -m py_compile lambda_function.py
+          zip -j function.zip lambda_function.py
+          aws lambda update-function-code --function-name stale-deal-scanner --zip-file fileb://function.zip
