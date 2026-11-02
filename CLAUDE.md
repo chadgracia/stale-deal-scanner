@@ -14,6 +14,13 @@
   Chad's report ("Due for review" + "Heads-up"). Hold deals are skipped entirely.
 - Client reminders will be a separate future feature (`compose_email` is kept, unused, for it).
 - Tests: `python3 -m unittest discover tests` (fake S3/SES/Pipeline; asserts no PUTs and Chad-only email).
+- Last Confirmed: deal date field `LAST_CONFIRMED_FIELD = "custom_label_4012491"` (write `YYYY-MM-DD`, reads back `YYYY/MM/DD`).
+  One-time backfill: manual invoke `{"backfill_last_confirmed": "dry" | "execute"}` (never reachable from
+  EventBridge or the Function URL). It only fills blanks, re-GETs each deal before writing, and PUTs that one field only.
+- Shared Unconfirmed rule (for future work): a deal is Unconfirmed when `LAST_CONFIRMED_FIELD` is blank or older than
+  its threshold. Threshold = Refresh field `custom_label_3994687` if set (0 = never Unconfirmed); otherwise 30 days
+  if Seller Role `custom_label_3938748` = 7020357 (GP — syndicating new allocation), else 60 days.
+  Hold deals are never Unconfirmed.
 
 ## Obsolete review page (Function URL)
 - `?action=review&key=<ADMIN_KEY>` (GET, read-only): every Obsolete deal, live from Pipeline via

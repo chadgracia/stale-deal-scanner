@@ -25,6 +25,8 @@ Invocations:
   {"diagnose": true}                 → legacy diagnostic (unchanged)
   {"restore": "dry"}                 → list the Sep 23 2026 obsoleted deals, change nothing
   {"restore": "execute"}             → move them to Inquiry, Refresh = 90
+  {"backfill_last_confirmed": "dry"}     → list active deals with blank Last Confirmed, change nothing
+  {"backfill_last_confirmed": "execute"} → write Last Confirmed = snapshot updated_at date (one-time)
   Function URL GET/POST ?action=reset → Chad's Reset button
   Function URL ?action=review&key=ADMIN_KEY → Obsolete review page (tick deals to restore;
                                        review_apply / review_undo are its POSTs)
@@ -112,6 +114,16 @@ RESTORE_NAMES = {
     "Flexport: $450K Sell",
 }
 RESTORE_EXPECTED = 50
+
+# One-time backfill of Last Confirmed (LAST_CONFIRMED_FIELD, defined with the review page below)
+BACKFILL_STAGES = {
+    2109142: "Inquiry", 111800: "Firm", 2094373: "Hold", 2381534: "Matched",
+    2388323: "Confirm", 2517909: "LOI Signed", 2381535: "SPA Signed",
+    2533998: "Transfer Notice", 2426790: "ROFR-ed",
+}
+BACKFILL_PACE_SECONDS = 0.3
+BACKFILL_MAX_RETRIES = 3
+BACKFILL_MAX_CONSECUTIVE_FAILURES = 5
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1305,12 +1317,131 @@ def run_restore(mode):
     return {"statusCode": 200, "mode": mode, "matched": len(matches), "restored": done, "failed": failed}
 
 
+# ── One-time Last Confirmed backfill (manual invocation only) ────────────────
+
+def _is_blank(v):
+    if isinstance(v, list):
+        v = v[0] if v else None
+    return v is None or str(v).strip() == ""
+
+
+def _snapshot_date(updated_at):
+    """'2024/11/26 06:19:44 -0500' -> '2024-11-26' (None if unparseable)."""
+    raw = str(updated_at or "").strip()[:10].replace("/", "-")
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _api_with_retry(method, endpoint, payload=None, jwt=None):
+    """call_pipeline_api with backoff on 429/5xx (up to BACKFILL_MAX_RETRIES retries)."""
+    res = call_pipeline_api(method, endpoint, payload, jwt=jwt)
+    for attempt in range(BACKFILL_MAX_RETRIES):
+        if not (res["status"] == 429 or res["status"] >= 500):
+            break
+        time.sleep(2 ** (attempt + 1))
+        res = call_pipeline_api(method, endpoint, payload, jwt=jwt)
+    return res
+
+
+def run_backfill_last_confirmed(mode):
+    execute = (mode == "execute")
+    now = datetime.now(timezone.utc)
+    tag_day = now.strftime('%Y-%m-%d')
+    try:
+        all_deals = (load_json_from_s3(CACHE_BUCKET, "deals.json") or {}).get("deals") or []
+    except Exception as e:
+        logger.error(f"backfill: deals.json load failed: {e}")
+        all_deals = []
+    if not all_deals:
+        send_email(CHAD_EMAIL, f"Last Confirmed Backfill — ABORTED — {tag_day}",
+                   "deals.json snapshot was empty or missing. Nothing written.")
+        return {"statusCode": 500, "error": "empty snapshot"}
+
+    selected, unparseable = [], []
+    for d in all_deals:
+        stage_id = (d.get("deal_stage") or {}).get("id")
+        if stage_id not in BACKFILL_STAGES:
+            continue
+        if not _is_blank((d.get("custom_fields") or {}).get(LAST_CONFIRMED_FIELD)):
+            continue  # already has a value: never touch
+        date = _snapshot_date(d.get("updated_at") or d.get("updated"))
+        if not date:
+            unparseable.append(d)
+            continue
+        selected.append((d, BACKFILL_STAGES[stage_id], date))
+    selected.sort(key=lambda x: (x[1], x[0].get("name") or ""))
+
+    def label(d, stage, date):
+        return f"{d.get('name', '')} (id={d.get('id')}, {stage}) → {date}"
+
+    tail = [f"  • {d.get('name', '')} (id={d.get('id')}) — no usable updated_at, skipped" for d in unparseable]
+
+    if not execute:
+        lines = [f"Last Confirmed backfill — DRY RUN, nothing changed ({tag_day})",
+                 f"Deals that would be written: {len(selected)}", ""]
+        lines += [f"  • {label(*x)}" for x in selected]
+        if tail:
+            lines += ["", f"Skipped, no usable updated_at ({len(tail)}):"] + tail
+        send_email(CHAD_EMAIL, f"Last Confirmed Backfill — DRY RUN — {tag_day}", "\n".join(lines))
+        return {"statusCode": 200, "mode": mode, "selected": len(selected)}
+
+    jwt = get_jwt()
+    written, skipped, failed, not_tried = [], [], [], []
+    consecutive = 0
+    stopped = False
+    for i, (d, stage, date) in enumerate(selected):
+        if stopped:
+            not_tried.append(f"  • {label(d, stage, date)}")
+            continue
+        did = d.get("id")
+        live = _api_with_retry("GET", f"/deals/{did}.json", jwt=jwt)
+        if live["status"] != 200 or not isinstance(live["data"], dict):
+            failed.append(f"  • {label(d, stage, date)} — live GET failed {live['status']}")
+            continue
+        live_val = (live["data"].get("custom_fields") or {}).get(LAST_CONFIRMED_FIELD)
+        if not _is_blank(live_val):
+            skipped.append(f"  • {label(d, stage, date)} — already set live ({live_val})")
+            continue
+        if written or failed:
+            time.sleep(BACKFILL_PACE_SECONDS)
+        r = _api_with_retry("PUT", f"/deals/{did}.json",
+                            {"deal": {"custom_fields": {LAST_CONFIRMED_FIELD: date}}}, jwt=jwt)
+        if r["status"] == 200:
+            written.append(f"  • {label(d, stage, date)}")
+            consecutive = 0
+        else:
+            failed.append(f"  • {label(d, stage, date)} — PUT failed {r['status']} {str(r['data'])[:120]}")
+            consecutive += 1
+            if consecutive >= BACKFILL_MAX_CONSECUTIVE_FAILURES:
+                stopped = True
+
+    summary = f"Written {len(written)}, skipped {len(skipped) + len(tail)}, failed {len(failed)}"
+    if stopped:
+        summary += f", not attempted {len(not_tried)}"
+    lines = [f"Last Confirmed backfill — EXECUTED ({tag_day})", summary]
+    if stopped:
+        lines.append(f"STOPPED after {BACKFILL_MAX_CONSECUTIVE_FAILURES} PUT failures in a row.")
+    for title, rows in (("Written", written), ("Skipped — already set live", skipped),
+                        ("Skipped — no usable updated_at", tail), ("Failed", failed),
+                        ("Not attempted (stopped)", not_tried)):
+        if rows:
+            lines += ["", f"{title} ({len(rows)}):"] + rows
+    send_email(CHAD_EMAIL, f"Last Confirmed Backfill — EXECUTED — {tag_day}", "\n".join(lines))
+    return {"statusCode": 200, "mode": mode, "written": len(written),
+            "skipped": len(skipped) + len(tail), "failed": len(failed), "stopped": stopped}
+
+
 # ── Main handler ──────────────────────────────────────────────────────────────
 
 def lambda_handler(event, context):
     event = event or {}
     if isinstance(event.get("requestContext"), dict) and "http" in event["requestContext"]:
         return handle_web(event)
+    if (event.get("backfill_last_confirmed") in ("dry", "execute")
+            and event.get("source") != "aws.events"):  # manual invoke only; never EventBridge
+        return run_backfill_last_confirmed(event["backfill_last_confirmed"])
     if event.get("restore") in ("dry", "execute"):
         return run_restore(event["restore"])
     if event.get("diagnose"):
