@@ -26,8 +26,10 @@ Invocations:
   {"restore": "dry"}                 → list the Sep 23 2026 obsoleted deals, change nothing
   {"restore": "execute"}             → move them to Inquiry, Refresh = 90
   Function URL GET/POST ?action=reset → Chad's Reset button
+  Function URL ?action=review&key=ADMIN_KEY → Obsolete review page (tick deals to restore;
+                                       review_apply / review_undo are its POSTs)
 
-Env vars: FORM_LAMBDA_URL, HMAC_SECRET, DRY_RUN, TEST_EMAIL_OVERRIDE,
+Env vars: FORM_LAMBDA_URL, HMAC_SECRET, DRY_RUN, TEST_EMAIL_OVERRIDE, ADMIN_KEY (review page),
           SCANNER_URL (this Lambda's Function URL; Reset links omitted if blank)
 """
 
@@ -42,6 +44,7 @@ import hashlib
 import base64
 import html
 import os
+import time
 from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger()
@@ -62,6 +65,7 @@ HMAC_SECRET         = os.environ.get("HMAC_SECRET", "change-me-in-env")
 DRY_RUN             = os.environ.get("DRY_RUN", "false").lower() == "true"
 TEST_EMAIL_OVERRIDE = os.environ.get("TEST_EMAIL_OVERRIDE", "").strip()
 SCANNER_URL         = os.environ.get("SCANNER_URL", "").strip()
+ADMIN_KEY           = os.environ.get("ADMIN_KEY", "").strip()   # review page; blank → page refuses all access
 
 GRACE_DAYS          = 3
 HEADSUP_DAYS        = 7
@@ -591,6 +595,9 @@ def handle_web(event):
         for k, v in urllib.parse.parse_qs(body).items():
             params[k] = v[0]
 
+    if params.get("action") in ("review", "review_apply", "review_undo"):
+        return handle_review(method, params)
+
     if params.get("action") != "reset":
         return _page("Not found", "<p>Nothing here.</p>")
 
@@ -701,6 +708,530 @@ def handle_web(event):
         due = datetime.now(timezone.utc) + timedelta(days=days)
         msg = f"clock restarted — next due {fmt_day(due)} ({days} days)"
     return _page("Done", f"<p><b>{e(info['name'])}</b>: {msg}. Any pending removal is cancelled.</p>")
+
+
+# ── Obsolete review (admin page on the Function URL) ─────────────────────────
+# action=review (GET, read-only) · action=review_apply (POST) · action=review_undo (POST)
+# All three require key == ADMIN_KEY. Nothing is written to Pipeline without an explicit tick + Apply.
+
+CONFIRM_STAGE_ID     = 2388323
+HOLD_STAGE_ID        = 2094373
+LAST_CONFIRMED_FIELD = "custom_label_4012491"   # date, written as YYYY-MM-DD
+STRUCTURE_FIELD      = "custom_label_3064360"
+STRUCTURE_LABELS     = {6250090: "Direct", 5077906: "Fund", 5077903: "Forward", 6361933: "Unknown", 5077909: "None"}
+ACTIVE_STAGE_IDS     = {2109142, 111800, 2381534, 2388323, 2094373}  # Inquiry, Firm, Matched, Confirm, Hold
+STAGE_NAMES          = {OBSOLETE_STAGE_ID: "Obsolete", INQUIRY_STAGE_ID: "Inquiry", CONFIRM_STAGE_ID: "Confirm",
+                        HOLD_STAGE_ID: "Hold", 111800: "Firm", 2381534: "Matched"}
+REVIEW_CACHE_KEY     = "obsolete-review/deals.json"
+REVIEW_LOG_KEY       = "obsolete-review/log.json"
+REVIEW_CACHE_SECONDS = 15 * 60
+REVIEW_BATCH         = 50
+REVIEW_DEFAULT_AFTER = "2026-03-30"
+
+
+def _stage_of(d):
+    return (d.get("deal_stage") or {}).get("id") or d.get("deal_stage_id")
+
+
+def _company_of(d):
+    return (d.get("company") or {}).get("name") or d.get("company_name") or ""
+
+
+def _contact_of(d):
+    pc = d.get("primary_contact") or {}
+    cid = pc.get("id") or d.get("primary_contact_id")
+    name = pc.get("full_name") or " ".join(x for x in (pc.get("first_name"), pc.get("last_name")) if x)
+    return cid, name or "", (pc.get("email") or "").strip()
+
+
+def _is_anthropic_sell(d):
+    cf = d.get("custom_fields") or {}
+    return is_sell(cf) and (_company_of(d).strip().lower().startswith("anthropic")
+                            or (d.get("name") or "").strip().lower().startswith("anthropic"))
+
+
+def _iso_day(s):
+    dt = parse_pipeline_dt(s or "")
+    return dt.strftime("%Y-%m-%d") if dt else ""
+
+
+def _dup_key(d):
+    comp = (d.get("company") or {}).get("id") or d.get("company_id") or _company_of(d).strip().lower()
+    cid = _contact_of(d)[0]
+    if not comp or not cid:
+        return None
+    return (str(comp), is_sell(d.get("custom_fields") or {}), str(cid))
+
+
+def _review_row(d):
+    cf = d.get("custom_fields") or {}
+    sell = is_sell(cf)
+    st = cf.get(STRUCTURE_FIELD)
+    st_ids = st if isinstance(st, list) else ([st] if st else [])
+    cid, cname, cemail = _contact_of(d)
+    return {
+        "id": d.get("id"),
+        "name": d.get("name") or str(d.get("id")),
+        "side": "Sell" if sell else "Buy",
+        "structure": ", ".join(STRUCTURE_LABELS.get(x, str(x)) for x in st_ids),
+        "size": fmt_size(parse_cf_value(cf, MIN_SIZE_FIELD), parse_cf_value(cf, MAX_SIZE_FIELD)),
+        "price": fmt_price(parse_cf_value(cf, NET_FIELD if sell else GROSS_FIELD)),
+        "contact": cname,
+        "email": cemail,
+        "created": _iso_day(d.get("created_at")),
+        "updated": _iso_day(d.get("updated_at")),
+        "updated_raw": d.get("updated_at") or "",
+        "anthropic_sell": _is_anthropic_sell(d),
+        "dup_key": list(_dup_key(d) or []),
+    }
+
+
+def _retryable(status):
+    return status == 429 or status >= 500
+
+
+def _get_with_retry(endpoint, jwt):
+    r = call_pipeline_api("GET", endpoint, jwt=jwt)
+    for wait in (2, 4, 8):
+        if not _retryable(r["status"]):
+            break
+        time.sleep(wait)
+        r = call_pipeline_api("GET", endpoint, jwt=jwt)
+    return r
+
+
+def _put_with_retry(endpoint, payload, jwt):
+    """One retry after a back-off on 429; any other failure is returned as-is."""
+    r = call_pipeline_api("PUT", endpoint, payload, jwt=jwt)
+    if r["status"] == 429:
+        time.sleep(5)
+        r = call_pipeline_api("PUT", endpoint, payload, jwt=jwt)
+    return r
+
+
+def fetch_review_rows(jwt):
+    """Every Obsolete deal, live. NOTE: conditions[deal_stage]=ID with NO [] — the [] form is
+    silently ignored by Pipeline and returns unfiltered deals. Stage is re-checked per row anyway."""
+    out, page, total = [], 1, None
+    while page <= 200:
+        if page > 1:
+            time.sleep(0.25)
+        res = _get_with_retry(f"/deals.json?conditions[deal_stage]={OBSOLETE_STAGE_ID}&per_page=200&page={page}", jwt)
+        if res["status"] != 200 or not isinstance(res["data"], dict):
+            raise RuntimeError(f"Pipeline list failed on page {page}: {res['status']} {str(res['data'])[:200]}")
+        entries = res["data"].get("entries") or []
+        total = (res["data"].get("pagination") or {}).get("total", total)
+        out.extend(entries)
+        if not entries or (total is not None and len(out) >= total):
+            break
+        page += 1
+    rows = [_review_row(d) for d in out if _stage_of(d) == OBSOLETE_STAGE_ID]
+    rows.sort(key=lambda r: (r["updated_raw"] or "").replace("-", "/")[:19], reverse=True)
+    return rows
+
+
+def load_review_rows(refresh=False):
+    """(rows, fetched_at_iso). Uses the 15-minute S3 cache unless refresh."""
+    now = datetime.now(timezone.utc)
+    if not refresh:
+        try:
+            c = load_json_from_s3(CACHE_BUCKET, REVIEW_CACHE_KEY)
+            fetched = datetime.fromisoformat(c["fetched_at"])
+            if (now - fetched).total_seconds() < REVIEW_CACHE_SECONDS and isinstance(c.get("rows"), list):
+                return c["rows"], c["fetched_at"]
+        except Exception:
+            pass
+    rows = fetch_review_rows(get_jwt())
+    fetched_at = now.isoformat()
+    try:
+        boto3.client('s3').put_object(Bucket=CACHE_BUCKET, Key=REVIEW_CACHE_KEY,
+                                      Body=json.dumps({"fetched_at": fetched_at, "rows": rows}).encode(),
+                                      ContentType="application/json")
+    except Exception as e:
+        logger.error(f"review: cache save failed: {e}")
+    return rows, fetched_at
+
+
+def load_review_log():
+    """(entries, ok). A missing log is an empty log; an unreadable one is not ok."""
+    try:
+        data = load_json_from_s3(CACHE_BUCKET, REVIEW_LOG_KEY)
+    except Exception as e:
+        code = ""
+        resp = getattr(e, "response", None)
+        if isinstance(resp, dict):
+            code = str((resp.get("Error") or {}).get("Code", ""))
+        if code in ("NoSuchKey", "404") or "NoSuchKey" in str(e):
+            return [], True
+        logger.error(f"review: log read failed: {e}")
+        return [], False
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        logger.error("review: log has unexpected shape")
+        return [], False
+    return entries, True
+
+
+def save_review_log(entries):
+    try:
+        boto3.client('s3').put_object(Bucket=CACHE_BUCKET, Key=REVIEW_LOG_KEY,
+                                      Body=json.dumps({"entries": entries}).encode(),
+                                      ContentType="application/json")
+        return True
+    except Exception as e:
+        logger.error(f"review: log save failed: {e}")
+        return False
+
+
+def _latest_by_deal(entries):
+    latest = {}
+    for en in entries:
+        latest[str(en.get("deal_id"))] = en
+    return latest
+
+
+def _id_list(raw):
+    out, seen = [], set()
+    for x in str(raw or "").replace(" ", "").split(","):
+        if x.isdigit() and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _wide_page(title, inner):
+    return {
+        "statusCode": 200,
+        "headers": {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"},
+        "body": f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(title)}</title></head>
+<body style="font-family:Arial,sans-serif;font-size:14px;max-width:900px;margin:30px auto;padding:0 16px;color:#222;line-height:1.5;">
+{inner}</body></html>""",
+    }
+
+
+def _undo_form(did, key):
+    e = html.escape
+    return (f'<form style="display:inline;" method="POST" action="" '
+            f'onsubmit="return confirm(\'Move deal {e(str(did))} back to Obsolete?\')">'
+            f'<input type="hidden" name="action" value="review_undo">'
+            f'<input type="hidden" name="key" value="{e(key)}">'
+            f'<input type="hidden" name="deal_id" value="{e(str(did))}">'
+            f'<button style="background:none;border:0;color:#06c;text-decoration:underline;padding:0;cursor:pointer;font-size:12px;">Undo</button></form>')
+
+
+def _deal_link(did, name):
+    return f'<a href="https://app.pipelinecrm.com/deals/{html.escape(str(did))}" target="_blank">{html.escape(name)}</a>'
+
+
+def handle_review(method, params):
+    key = str(params.get("key", "")).strip()
+    if not ADMIN_KEY or not hmac.compare_digest(key.encode(), ADMIN_KEY.encode()):
+        return _page("Not found", "<p>Nothing here.</p>")
+    action = params.get("action")
+    if action == "review":
+        return review_page(params)
+    if method != "POST":
+        return _page("Not found", "<p>Nothing here.</p>")
+    if action == "review_apply":
+        return review_apply(params)
+    return review_undo(params)
+
+
+REVIEW_TEMPLATE = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Obsolete review</title>
+<style>
+body{font-family:Arial,sans-serif;font-size:13px;color:#222;margin:20px;}
+table{border-collapse:collapse;width:100%;}
+th,td{padding:5px 8px;border-bottom:1px solid #eee;text-align:left;vertical-align:top;}
+th{background:#f6f6f6;position:sticky;top:0;}
+.chip{display:inline-block;font-size:11px;padding:1px 7px;border-radius:9px;margin:1px 2px;background:#fde8e8;color:#a00;white-space:nowrap;}
+.chip.hold{background:#fff4e5;color:#a60;}
+.chip.muted{background:#eee;color:#777;}
+.bar{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center;margin:12px 0;}
+.muted{color:#888;}
+#apply{background:#1a1a1a;color:#fff;border:0;padding:8px 16px;border-radius:4px;cursor:pointer;}
+.undo{background:none;border:0;color:#06c;text-decoration:underline;padding:0;font-size:11px;cursor:pointer;}
+</style></head><body>
+<h2 style="margin:0 0 4px;">Obsolete deals — review</h2>
+<div class="muted">Every deal stays Obsolete unless you tick it and click Apply. List fetched __FETCHED__ · <a href="__REFRESH__">Refresh list</a></div>
+<form id="f" method="POST" action="" onsubmit="return go()">
+<input type="hidden" name="action" value="review_apply">
+<input type="hidden" name="key" value="__KEY__">
+<input type="hidden" name="ids" id="ids"><input type="hidden" name="kept" id="kept">
+<div class="bar">
+ <b><span id="shown">0</span> shown / __TOTAL__</b>
+ <label>Restore ticked to <select name="stage" id="stage"><option value="inquiry" selected>Inquiry</option><option value="confirm">Confirm</option></select></label>
+ <label>Side <select id="side"><option>All</option><option>Buy</option><option>Sell</option></select></label>
+ <label>Last updated after <input type="date" id="after" value="__AFTER__"></label>
+ <input type="search" id="q" placeholder="Search name or client">
+ <label><input type="checkbox" id="hideRev" checked> Hide deals already reviewed</label>
+ <button type="button" onclick="selAll()">Select all visible</button>
+ <button type="button" onclick="clr()">Clear</button>
+ <button type="submit" id="apply">Apply (0)</button>
+</div></form>
+<table><thead><tr><th></th><th>Deal</th><th>Side</th><th>Structure</th><th>Size</th><th>Price</th><th>Client</th><th>Created</th><th>Last updated</th></tr></thead>
+<tbody id="tb"></tbody></table>
+<script>
+const ROWS = __DATA__;
+const KEY = __KEYJS__;
+const ticked = new Set();
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+function restored(r){return r.reviewed && r.reviewed.action==="restored";}
+function reviewed(r){return r.reviewed && (r.reviewed.action==="restored" || r.reviewed.action==="kept");}
+function vis(){
+  const side=document.getElementById("side").value, after=document.getElementById("after").value,
+        q=document.getElementById("q").value.trim().toLowerCase(), hide=document.getElementById("hideRev").checked;
+  return ROWS.filter(r=>(side==="All"||r.side===side) && (!after || r.updated>after) &&
+    (!q || (r.name+" "+r.contact+" "+r.email).toLowerCase().includes(q)) && !(hide && reviewed(r)));
+}
+function undoForm(id){
+  return '<form style="display:inline" method="POST" action="" onsubmit="return confirm(\'Move deal '+id+' back to Obsolete?\')">'+
+    '<input type="hidden" name="action" value="review_undo"><input type="hidden" name="key" value="'+esc(KEY)+'">'+
+    '<input type="hidden" name="deal_id" value="'+id+'"><button class="undo">Undo</button></form>';
+}
+function render(){
+  const v=vis(); document.getElementById("shown").textContent=v.length;
+  document.getElementById("tb").innerHTML=v.map(r=>{
+    let chips="";
+    if(r.dup) chips+='<span class="chip">Live duplicate</span>';
+    if(r.anthropic_sell) chips+='<span class="chip hold">Anthropic sell → will go to Hold</span>';
+    if(r.reviewed){
+      const a=r.reviewed.action, d=esc((r.reviewed.at||"").slice(0,10));
+      if(a==="restored") chips+='<span class="chip muted">Restored '+d+'</span> '+undoForm(r.id);
+      else if(a==="kept") chips+='<span class="chip muted">Kept '+d+'</span>';
+      else if(a==="undone") chips+='<span class="chip muted">Undone '+d+'</span>';
+    }
+    const client=esc(r.contact||"—")+(r.email?'<br><span class="muted">'+esc(r.email)+'</span>':"");
+    return '<tr><td><input type="checkbox" data-id="'+r.id+'"'+(ticked.has(r.id)?" checked":"")+(restored(r)?" disabled":"")+' onchange="tick(this)"></td>'+
+      '<td><a href="https://app.pipelinecrm.com/deals/'+r.id+'" target="_blank">'+esc(r.name)+'</a> '+chips+'</td>'+
+      '<td>'+esc(r.side)+'</td><td>'+esc(r.structure)+'</td><td>'+esc(r.size)+'</td><td>'+esc(r.price)+'</td>'+
+      '<td>'+client+'</td><td>'+esc(r.created)+'</td><td>'+esc(r.updated)+'</td></tr>';
+  }).join("");
+  upd();
+}
+function tick(el){const id=Number(el.dataset.id); if(el.checked) ticked.add(id); else ticked.delete(id); upd();}
+function picked(){return vis().filter(r=>ticked.has(r.id) && !restored(r));}
+function upd(){document.getElementById("apply").textContent="Apply ("+picked().length+")";}
+function selAll(){vis().forEach(r=>{if(!restored(r)) ticked.add(r.id);}); render();}
+function clr(){ticked.clear(); render();}
+function go(){
+  const v=vis(), t=picked(), k=v.filter(r=>!ticked.has(r.id) && !restored(r));
+  const st=document.getElementById("stage").selectedOptions[0].text;
+  const msg="Restore "+t.length+" deal(s) to "+st+" (Anthropic sells go to Hold)?\n"+k.length+" other visible deal(s) will be recorded as kept Obsolete."+
+    (t.length>50?"\n\n"+t.length+" ticked: the first 50 are applied now; you'll get a Continue button for the rest.":"");
+  if(!confirm(msg)) return false;
+  document.getElementById("ids").value=t.map(r=>r.id).join(",");
+  document.getElementById("kept").value=k.map(r=>r.id).join(",");
+  return true;
+}
+["side","after","q","hideRev"].forEach(id=>document.getElementById(id).addEventListener("input",render));
+document.getElementById("hideRev").addEventListener("change",render);
+render();
+</script></body></html>"""
+
+
+def review_page(params):
+    """GET: read-only. Never writes to Pipeline (only the S3 list cache)."""
+    key = str(params.get("key", "")).strip()
+    refresh = str(params.get("refresh", "")) == "1"
+    try:
+        rows, fetched_at = load_review_rows(refresh=refresh)
+    except Exception as ex:
+        logger.error(f"review: list failed: {ex}")
+        return _page("Error", f"<p>Could not load Obsolete deals from Pipeline: {html.escape(str(ex)[:300])}</p>")
+
+    dup_keys = set()
+    try:
+        for d in load_json_from_s3(CACHE_BUCKET, "deals.json").get("deals", []):
+            if _stage_of(d) in ACTIVE_STAGE_IDS:
+                k = _dup_key(d)
+                if k:
+                    dup_keys.add(k)
+    except Exception as ex:
+        logger.error(f"review: snapshot load failed: {ex}")
+
+    entries, _ok = load_review_log()
+    latest = _latest_by_deal(entries)
+    out = []
+    for r in rows:
+        r = dict(r)
+        r["dup"] = bool(r.get("dup_key")) and tuple(r["dup_key"]) in dup_keys
+        en = latest.get(str(r["id"]))
+        r["reviewed"] = {"action": en.get("action"), "at": en.get("at", "")} if en else None
+        r.pop("dup_key", None)
+        r.pop("updated_raw", None)
+        out.append(r)
+
+    base = SCANNER_URL.rstrip('/') + "/" if SCANNER_URL else ""
+    refresh_url = f"{base}?action=review&key={urllib.parse.quote(key)}&refresh=1"
+    try:
+        fetched_lbl = datetime.fromisoformat(fetched_at).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        fetched_lbl = fetched_at
+    page = (REVIEW_TEMPLATE
+            .replace("__DATA__", json.dumps(out).replace("</", "<\\/"))
+            .replace("__KEYJS__", json.dumps(key).replace("</", "<\\/"))
+            .replace("__KEY__", html.escape(key))
+            .replace("__FETCHED__", html.escape(fetched_lbl))
+            .replace("__REFRESH__", html.escape(refresh_url))
+            .replace("__TOTAL__", str(len(out)))
+            .replace("__AFTER__", REVIEW_DEFAULT_AFTER))
+    return {"statusCode": 200, "headers": {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"},
+            "body": page}
+
+
+def review_apply(params):
+    key = str(params.get("key", "")).strip()
+    chosen = CONFIRM_STAGE_ID if params.get("stage") == "confirm" else INQUIRY_STAGE_ID
+    stage_param = "confirm" if chosen == CONFIRM_STAGE_ID else "inquiry"
+    ids = _id_list(params.get("ids"))
+    kept_ids = [k for k in _id_list(params.get("kept")) if k not in set(ids)]
+    batch, rest = ids[:REVIEW_BATCH], ids[REVIEW_BATCH:]
+    now = datetime.now(timezone.utc)
+    e = html.escape
+
+    entries, ok = load_review_log()
+    if not ok:
+        return _wide_page("Error", "<p><b>Could not read the review log.</b> Nothing was changed in Pipeline. Try again.</p>")
+
+    cached = {}
+    if kept_ids:
+        try:
+            cached = {str(r.get("id")): r for r in load_json_from_s3(CACHE_BUCKET, REVIEW_CACHE_KEY).get("rows", [])}
+        except Exception:
+            cached = {}
+    for k in kept_ids:
+        r = cached.get(k, {})
+        entries.append({"deal_id": int(k), "name": r.get("name", ""), "action": "kept",
+                        "previous_stage": OBSOLETE_STAGE_ID, "previous_updated_at": r.get("updated_raw", ""),
+                        "at": now.isoformat()})
+    # Log must be writable before anything is written to Pipeline.
+    if not save_review_log(entries):
+        return _wide_page("Error", "<p><b>Could not save the review log.</b> Nothing was changed in Pipeline. "
+                                   "The scanner role needs s3:PutObject on full-pipeline-cache/obsolete-review/*.</p>")
+
+    jwt = get_jwt() if batch else None
+    restored, skipped, failed = [], [], []
+    for i, did in enumerate(batch):
+        if i:
+            time.sleep(1)
+        r = _get_with_retry(f"/deals/{did}.json", jwt)
+        if r["status"] != 200 or not isinstance(r["data"], dict):
+            failed.append((did, did, f"read failed ({r['status']})"))
+            continue
+        d = r["data"]
+        name = d.get("name") or did
+        prev_stage = _stage_of(d)
+        if prev_stage != OBSOLETE_STAGE_ID:
+            skipped.append((did, name, f"no longer Obsolete (now {STAGE_NAMES.get(prev_stage, prev_stage)})"))
+            continue
+        target = HOLD_STAGE_ID if _is_anthropic_sell(d) else chosen
+        prev_updated = d.get("updated_at") or ""
+        payload = {"deal": {"deal_stage_id": target}}
+        day = _iso_day(prev_updated)
+        if day:
+            payload["deal"]["custom_fields"] = {LAST_CONFIRMED_FIELD: day}
+
+        entry = {"deal_id": int(did), "name": name, "action": "restored", "new_stage": STAGE_NAMES[target],
+                 "new_stage_id": target, "previous_stage": prev_stage, "previous_updated_at": prev_updated,
+                 "at": datetime.now(timezone.utc).isoformat()}
+        entries.append(entry)
+        if not save_review_log(entries):
+            entries.pop()
+            rest = batch[i:] + rest
+            failed.append((did, name, "log save failed — stopped this batch before writing"))
+            break
+        pr = _put_with_retry(f"/deals/{did}.json", payload, jwt)
+        if pr["status"] != 200:
+            entry["action"] = "restore_failed"
+            entry["error"] = str(pr["status"])
+            save_review_log(entries)
+            failed.append((did, name, f"Pipeline rejected ({pr['status']})"))
+            continue
+        restored.append((did, name, STAGE_NAMES[target]))
+
+    # One summary email to Chad per batch.
+    lines = [f"Obsolete review — {now.strftime('%Y-%m-%d %H:%M UTC')}",
+             f"Restored {len(restored)}, kept {len(kept_ids)}, skipped {len(skipped)}, failed {len(failed)}, "
+             f"still to do {len(rest)}", ""]
+    lines += [f"Restored ({len(restored)}):"] + [f"  • {n} → {s} (id={d})" for d, n, s in restored] + [""]
+    lines += [f"Skipped ({len(skipped)}):"] + [f"  • {n} — {why} (id={d})" for d, n, why in skipped] + [""]
+    lines += [f"Failed ({len(failed)}):"] + [f"  • {n} — {why} (id={d})" for d, n, why in failed] + [""]
+    lines += [f"Kept Obsolete ({len(kept_ids)}):"] + [f"  • {cached.get(k, {}).get('name') or k} (id={k})" for k in kept_ids]
+    try:
+        send_email(CHAD_EMAIL,
+                   f"Obsolete review — restored {len(restored)}, kept {len(kept_ids)}, skipped {len(skipped)}, failed {len(failed)}",
+                   "\n".join(lines))
+    except Exception as ex:
+        logger.error(f"review: summary email failed: {ex}")
+
+    def ul(items):
+        return "<ul>" + "".join(f"<li>{x}</li>" for x in items) + "</ul>" if items else "<p class=\"muted\" style=\"color:#888;\">(none)</p>"
+
+    parts = [f"<h2 style=\"margin-bottom:4px;\">Obsolete review — applied</h2>",
+             f"<p>Restored {len(restored)} · kept {len(kept_ids)} · skipped {len(skipped)} · failed {len(failed)}</p>",
+             f"<h3>Restored ({len(restored)})</h3>",
+             ul([f"{_deal_link(d, n)} → {e(s)} {_undo_form(d, key)}" for d, n, s in restored]),
+             f"<h3>Skipped ({len(skipped)})</h3>",
+             ul([f"{_deal_link(d, n)} — {e(why)}" for d, n, why in skipped]),
+             f"<h3>Failed ({len(failed)})</h3>",
+             ul([f"{_deal_link(d, n)} — {e(why)}" for d, n, why in failed])]
+    if rest:
+        nxt = min(len(rest), REVIEW_BATCH)
+        parts.append(f"""<h3>Still to do ({len(rest)})</h3>
+<form method="POST" action="" onsubmit="return confirm('Restore the next {nxt} deal(s)?')">
+  <input type="hidden" name="action" value="review_apply">
+  <input type="hidden" name="key" value="{e(key)}">
+  <input type="hidden" name="stage" value="{stage_param}">
+  <input type="hidden" name="ids" value="{e(','.join(rest))}">
+  <input type="hidden" name="kept" value="">
+  <button type="submit" style="background:#1a1a1a;color:#fff;border:0;padding:10px 20px;border-radius:4px;cursor:pointer;">Continue — next {nxt}</button>
+</form>""")
+        parts.append(ul([_deal_link(d, cached.get(d, {}).get("name") or f"Deal {d}") for d in rest]))
+    base = SCANNER_URL.rstrip('/') + "/" if SCANNER_URL else ""
+    parts.append(f'<p><a href="{e(base)}?action=review&amp;key={e(urllib.parse.quote(key))}">Back to the review list</a></p>')
+    return _wide_page("Obsolete review — applied", "".join(parts))
+
+
+def review_undo(params):
+    key = str(params.get("key", "")).strip()
+    did = str(params.get("deal_id", "")).strip()
+    e = html.escape
+    base = SCANNER_URL.rstrip('/') + "/" if SCANNER_URL else ""
+    back = f'<p><a href="{e(base)}?action=review&amp;key={e(urllib.parse.quote(key))}">Back to the review list</a></p>'
+    if not did.isdigit():
+        return _wide_page("Error", "<p>Missing deal id. Nothing changed.</p>" + back)
+    entries, ok = load_review_log()
+    if not ok:
+        return _wide_page("Error", "<p>Could not read the review log. Nothing changed.</p>" + back)
+    en = _latest_by_deal(entries).get(did)
+    if not en or en.get("action") != "restored":
+        return _wide_page("Error", f"<p>The review log does not show deal {e(did)} as restored. Nothing changed.</p>" + back)
+
+    jwt = get_jwt()
+    r = _get_with_retry(f"/deals/{did}.json", jwt)
+    if r["status"] != 200 or not isinstance(r["data"], dict):
+        return _wide_page("Error", f"<p>Could not load deal {e(did)} from Pipeline ({r['status']}). Nothing changed.</p>" + back)
+    d = r["data"]
+    name = d.get("name") or did
+    cur = _stage_of(d)
+    if cur == OBSOLETE_STAGE_ID:
+        return _wide_page("Already Obsolete", f"<p>{_deal_link(did, name)} is already Obsolete. Nothing changed.</p>" + back)
+
+    entry = {"deal_id": int(did), "name": name, "action": "undone", "previous_stage": cur,
+             "previous_updated_at": d.get("updated_at") or "", "at": datetime.now(timezone.utc).isoformat()}
+    entries.append(entry)
+    if not save_review_log(entries):
+        return _wide_page("Error", "<p>Could not save the review log. Nothing was changed in Pipeline.</p>" + back)
+    pr = _put_with_retry(f"/deals/{did}.json", {"deal": {"deal_stage_id": OBSOLETE_STAGE_ID}}, jwt)
+    if pr["status"] != 200:
+        entry["action"] = "undo_failed"
+        entry["error"] = str(pr["status"])
+        save_review_log(entries)
+        return _wide_page("Error", f"<p>Pipeline rejected the change ({pr['status']}). {_deal_link(did, name)} was not changed.</p>" + back)
+    return _wide_page("Undone", f"<p>{_deal_link(did, name)} moved back to Obsolete "
+                                f"(was {e(str(STAGE_NAMES.get(cur, cur)))}). Nothing else changed.</p>" + back)
 
 
 # ── One-time restore ──────────────────────────────────────────────────────────
@@ -898,6 +1429,9 @@ def run_scan():
 
     parts = [f"<p><b>Stale Deal Scanner — {now.strftime('%Y-%m-%d')}</b>{html.escape(dry)}</p>",
              "<p style=\"color:#888;\">Report only — the scanner no longer obsoletes deals or emails clients.</p>"]
+    review_link = f"{SCANNER_URL.rstrip('/')}/?action=review&key={ADMIN_KEY}" if SCANNER_URL and ADMIN_KEY else ""
+    if review_link:
+        parts.insert(1, f"<p><a href=\"{html.escape(review_link)}\">Review Obsolete deals</a></p>")
     if not SCANNER_URL:
         parts.append("<p style=\"color:#b00;\">Reset links disabled: SCANNER_URL env var is blank.</p>")
     parts.append(section(f"Due for review ({len(h_due)})", h_due))
@@ -905,6 +1439,7 @@ def run_scan():
     report_html = "<html><body style=\"font-family:Arial,sans-serif;font-size:14px;color:#222;line-height:1.5;\">" + "".join(parts) + "</body></html>"
 
     plain = [f"Stale Deal Scanner — {now.strftime('%Y-%m-%d')}{dry}",
+             *([f"Review Obsolete deals: {review_link}"] if review_link else []),
              "Report only — the scanner no longer obsoletes deals or emails clients.", "",
              f"Due for review ({len(due)}):", *[f"  • {d.get('name','')} — {s}, {a} days" for a, s, d in due], "",
              f"Heads-up — due in the next {HEADSUP_DAYS} days ({len(headsup)}):",
