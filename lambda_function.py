@@ -121,6 +121,8 @@ BACKFILL_STAGES = {
     2388323: "Confirm", 2517909: "LOI Signed", 2381535: "SPA Signed",
     2533998: "Transfer Notice", 2426790: "ROFR-ed",
 }
+# updated_at dates from the Sep 23 2026 bulk restore are not client confirmations: leave blank.
+BACKFILL_SKIP_DATE = "2026-09-23"
 BACKFILL_PACE_SECONDS = 0.3
 BACKFILL_MAX_RETRIES = 3
 BACKFILL_MAX_CONSECUTIVE_FAILURES = 5
@@ -1359,7 +1361,7 @@ def run_backfill_last_confirmed(mode):
                    "deals.json snapshot was empty or missing. Nothing written.")
         return {"statusCode": 500, "error": "empty snapshot"}
 
-    selected, unparseable = [], []
+    selected, unparseable, restore_dated = [], [], []
     for d in all_deals:
         stage_id = (d.get("deal_stage") or {}).get("id")
         if stage_id not in BACKFILL_STAGES:
@@ -1370,6 +1372,9 @@ def run_backfill_last_confirmed(mode):
         if not date:
             unparseable.append(d)
             continue
+        if date == BACKFILL_SKIP_DATE:
+            restore_dated.append((d, BACKFILL_STAGES[stage_id], date))
+            continue
         selected.append((d, BACKFILL_STAGES[stage_id], date))
     selected.sort(key=lambda x: (x[1], x[0].get("name") or ""))
 
@@ -1377,15 +1382,21 @@ def run_backfill_last_confirmed(mode):
         return f"{d.get('name', '')} (id={d.get('id')}, {stage}) → {date}"
 
     tail = [f"  • {d.get('name', '')} (id={d.get('id')}) — no usable updated_at, skipped" for d in unparseable]
+    restore_dated.sort(key=lambda x: (x[1], x[0].get("name") or ""))
+    restore_rows = [f"  • {d.get('name', '')} (id={d.get('id')}, {stage})" for d, stage, _ in restore_dated]
+    restore_head = f"Left blank — Sep 23 restore date ({len(restore_rows)}):"
 
     if not execute:
         lines = [f"Last Confirmed backfill — DRY RUN, nothing changed ({tag_day})",
                  f"Deals that would be written: {len(selected)}", ""]
         lines += [f"  • {label(*x)}" for x in selected]
+        if restore_rows:
+            lines += ["", restore_head] + restore_rows
         if tail:
             lines += ["", f"Skipped, no usable updated_at ({len(tail)}):"] + tail
         send_email(CHAD_EMAIL, f"Last Confirmed Backfill — DRY RUN — {tag_day}", "\n".join(lines))
-        return {"statusCode": 200, "mode": mode, "selected": len(selected)}
+        return {"statusCode": 200, "mode": mode, "selected": len(selected),
+                "left_blank_restore": len(restore_rows)}
 
     jwt = get_jwt()
     written, skipped, failed, not_tried = [], [], [], []
@@ -1420,6 +1431,7 @@ def run_backfill_last_confirmed(mode):
     summary = f"Written {len(written)}, skipped {len(skipped) + len(tail)}, failed {len(failed)}"
     if stopped:
         summary += f", not attempted {len(not_tried)}"
+    summary += f", left blank (Sep 23 restore) {len(restore_rows)}"
     lines = [f"Last Confirmed backfill — EXECUTED ({tag_day})", summary]
     if stopped:
         lines.append(f"STOPPED after {BACKFILL_MAX_CONSECUTIVE_FAILURES} PUT failures in a row.")
@@ -1428,9 +1440,12 @@ def run_backfill_last_confirmed(mode):
                         ("Not attempted (stopped)", not_tried)):
         if rows:
             lines += ["", f"{title} ({len(rows)}):"] + rows
+    if restore_rows:
+        lines += ["", restore_head] + restore_rows
     send_email(CHAD_EMAIL, f"Last Confirmed Backfill — EXECUTED — {tag_day}", "\n".join(lines))
     return {"statusCode": 200, "mode": mode, "written": len(written),
-            "skipped": len(skipped) + len(tail), "failed": len(failed), "stopped": stopped}
+            "skipped": len(skipped) + len(tail), "failed": len(failed), "stopped": stopped,
+            "left_blank_restore": len(restore_rows)}
 
 
 # ── Main handler ──────────────────────────────────────────────────────────────

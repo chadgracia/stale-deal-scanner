@@ -142,6 +142,31 @@ class Execute(BackfillBase):
         self.assertEqual(self.puts(), [])
 
 
+class Sep23RestoreDateLeftBlank(BackfillBase):
+    deals = DEALS + [deal(6, "Inquiry Restored Sep 23", 2109142, "2026/09/23 14:02:11 -0400"),
+                     deal(7, "Firm Restored Sep 23", 111800, "2026/09/23 09:00:00 -0400")]
+
+    def test_dry_lists_but_does_not_count(self):
+        res = self.lf.lambda_handler({"backfill_last_confirmed": "dry"}, None)
+        self.assertEqual(res["selected"], 3)
+        self.assertEqual(res["left_blank_restore"], 2)
+        _, text = self.body()
+        self.assertIn("Deals that would be written: 3", text)
+        head = text.index("Left blank — Sep 23 restore date (2):")
+        self.assertGreater(text.index("Inquiry Restored Sep 23 (id=6, Inquiry)"), head)
+        self.assertGreater(text.index("Firm Restored Sep 23 (id=7, Firm)"), head)
+        self.assertNotIn("2026-09-23", text)
+
+    def test_execute_never_touches_them(self):
+        res = self.lf.lambda_handler({"backfill_last_confirmed": "execute"}, None)
+        touched = {c[1] for c in self.api_calls}
+        self.assertNotIn("/deals/6.json", touched)
+        self.assertNotIn("/deals/7.json", touched)
+        self.assertEqual(res["written"], 2)
+        _, text = self.body()
+        self.assertIn("Left blank — Sep 23 restore date (2):", text)
+
+
 class StopsAfterFiveFailures(BackfillBase):
     deals = [deal(i, f"Deal {i}", 2109142, "2026/03/05 10:00:00 -0500") for i in range(1, 9)]
     live_cf = {}
