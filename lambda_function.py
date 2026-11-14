@@ -63,7 +63,12 @@ BEDROCK_MODEL       = "us.anthropic.claude-sonnet-4-6"
 OBSOLETE_STAGE_ID   = 2348038
 INQUIRY_STAGE_ID    = 2109142
 FORM_LAMBDA_URL     = os.environ.get("FORM_LAMBDA_URL", "")
-HMAC_SECRET         = os.environ.get("HMAC_SECRET", "change-me-in-env")
+HMAC_SECRET         = os.environ.get("HMAC_SECRET", "")
+# Previous HMAC_SECRET while it is being rotated (optional, empty = off). Only used
+# to recognise an old reset link so it gets the "expired" text; it is never accepted.
+HMAC_SECRET_OLD     = os.environ.get("HMAC_SECRET_OLD", "")
+LINK_EXPIRED_MSG    = ("This link has expired. Please use the link in our most recent email, "
+                       "or reply to that email and we will help.")
 DRY_RUN             = os.environ.get("DRY_RUN", "false").lower() == "true"
 TEST_EMAIL_OVERRIDE = os.environ.get("TEST_EMAIL_OVERRIDE", "").strip()
 SCANNER_URL         = os.environ.get("SCANNER_URL", "").strip()
@@ -268,17 +273,35 @@ def save_state(state):
         return False
 
 
-def make_token(deal_id: int) -> str:
-    """HMAC-SHA256 token so the form URL can't be guessed."""
-    msg = f"{deal_id}".encode()
-    sig = hmac.new(HMAC_SECRET.encode(), msg, hashlib.sha256).digest()
+def _sign(secret: str, msg: str) -> str:
+    sig = hmac.new(secret.encode(), msg.encode(), hashlib.sha256).digest()
     return base64.urlsafe_b64encode(sig).decode().rstrip("=")
+
+
+def make_token(deal_id: int) -> str:
+    """HMAC-SHA256 token so the form URL can't be guessed. Signs with the
+    current HMAC_SECRET only; empty key -> "" (never signs with an empty key)."""
+    return _sign(HMAC_SECRET, f"{deal_id}") if HMAC_SECRET else ""
 
 
 def make_reset_token(deal_id) -> str:
-    msg = f"reset:{deal_id}".encode()
-    sig = hmac.new(HMAC_SECRET.encode(), msg, hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(sig).decode().rstrip("=")
+    return _sign(HMAC_SECRET, f"reset:{deal_id}") if HMAC_SECRET else ""
+
+
+def reset_token_status(deal_id, token: str) -> str:
+    """"ok" (current HMAC_SECRET), "legacy" (HMAC_SECRET_OLD only; refused) or "bad".
+    Fails closed when HMAC_SECRET is empty."""
+    token = token or ""
+    if not HMAC_SECRET:
+        logger.error("HMAC_SECRET is not set: reset links are neither signed nor accepted.")
+        return "bad"
+    if not token:
+        return "bad"
+    if hmac.compare_digest(token, _sign(HMAC_SECRET, f"reset:{deal_id}")):
+        return "ok"
+    if HMAC_SECRET_OLD and hmac.compare_digest(token, _sign(HMAC_SECRET_OLD, f"reset:{deal_id}")):
+        return "legacy"
+    return "bad"
 
 
 def form_url(deal_id: int) -> str:
@@ -287,7 +310,7 @@ def form_url(deal_id: int) -> str:
 
 
 def reset_url(deal_id) -> str:
-    if not SCANNER_URL:
+    if not SCANNER_URL or not HMAC_SECRET:
         return ""
     return f"{SCANNER_URL.rstrip('/')}/?action=reset&deal_id={deal_id}&token={make_reset_token(deal_id)}"
 
@@ -617,7 +640,10 @@ def handle_web(event):
 
     deal_id = str(params.get("deal_id", "")).strip()
     token   = str(params.get("token", "")).strip()
-    if not deal_id.isdigit() or not hmac.compare_digest(token, make_reset_token(deal_id)):
+    _tok_status = reset_token_status(deal_id, token) if deal_id.isdigit() else "bad"
+    if _tok_status == "legacy":
+        return _page("Link expired", f"<p>{LINK_EXPIRED_MSG}</p>")
+    if _tok_status != "ok":
         return _page("Invalid link", "<p>This reset link is invalid.</p>")
 
     state = load_state()

@@ -4,7 +4,8 @@
   Push to `main` → `.github/workflows/deploy.yml` zips `lambda_function.py` and runs
   `aws lambda update-function-code` via the `github-actions-deploy` OIDC role.
 - Single-file package: `lambda_function.py` only (stdlib + `boto3` from the Lambda runtime). No vendored deps.
-- Secrets/config live only in Lambda env vars — `FORM_LAMBDA_URL`, `HMAC_SECRET`, `DRY_RUN`,
+- Secrets/config live only in Lambda env vars — `FORM_LAMBDA_URL`, `HMAC_SECRET` (no fallback; empty = no reset links
+  minted or accepted), optional `HMAC_SECRET_OLD` (an old reset link only gets the "expired" text), `DRY_RUN`,
   `TEST_EMAIL_OVERRIDE`, `SCANNER_URL`, `ADMIN_KEY` — never in code. Deploys do not change env vars or the EventBridge schedule.
 - Pipeline date fields come back as `YYYY/MM/DD` on read (e.g. `2024/11/26 06:19:44 -0500`).
 - Every change must keep the safeguard: never send client emails unless state can be saved
