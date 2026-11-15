@@ -1,6 +1,6 @@
 """Run: python3 -m unittest discover tests
 Obsolete review page with fake Pipeline / S3 / SES."""
-import io, json, os, sys, types, unittest, urllib.parse
+import base64, io, json, os, sys, types, unittest, urllib.parse
 
 CHAD = "cgracia@rainmakersecurities.com"
 KEY = "test-admin-key"
@@ -211,6 +211,37 @@ class ReviewTests(ReviewBase):
         self.assertEqual(self.pl.puts, [])
 
 
+class ConfirmObsoleteAjax(ReviewBase):
+    def confirm(self, kept, ids="", key=KEY, b64=False):
+        body = urllib.parse.urlencode({"action": "review_apply", "key": key, "ids": ids, "kept": kept, "ajax": "1"})
+        ev = {"requestContext": {"http": {"method": "POST"}}, "queryStringParameters": {}, "body": body}
+        if b64:
+            ev["body"], ev["isBase64Encoded"] = base64.b64encode(body.encode()).decode(), True
+        return self.lf.lambda_handler(ev, None)
+
+    def test_logs_kept_json_no_puts_no_email_ids_ignored(self):
+        self.build([mkdeal(1), mkdeal(2), mkdeal(3)])
+        r = self.confirm("2,3", ids="1", b64=True)
+        self.assertEqual(r["headers"]["Content-Type"], "application/json")
+        self.assertEqual(json.loads(r["body"]), {"ok": True, "kept": 2})
+        self.assertEqual(sorted((e["deal_id"], e["action"]) for e in self.log()), [(2, "kept"), (3, "kept")])
+        self.assertEqual(self.pl.puts, [])
+        self.assertEqual(self.ses.sent, [])
+
+    def test_wrong_key_refused(self):
+        self.build([mkdeal(1)])
+        r = self.confirm("1", key="nope")
+        self.assertIn("Nothing here.", r["body"])
+        self.assertEqual(self.log(), [])
+
+    def test_page_has_buttons(self):
+        self.build([mkdeal(1)])
+        body = self.web("GET", {"action": "review", "key": KEY})["body"]
+        self.assertIn('id="confirmObs"', body)
+        self.assertIn("Restore (0)", body)
+        self.assertNotIn("Apply (0)", body)
+
+
 class LogSaveFails(ReviewBase):
     fail_keys = ("obsolete-review/log.json",)
 
@@ -221,6 +252,14 @@ class LogSaveFails(ReviewBase):
         self.assertIn("Could not save the review log", r["body"])
         self.assertEqual(self.ses.sent, [])
 
+
+    def test_ajax_log_save_failure_returns_json_error(self):
+        self.build([mkdeal(1)])
+        body = urllib.parse.urlencode({"action": "review_apply", "key": KEY, "ids": "", "kept": "1", "ajax": "1"})
+        r = self.lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "queryStringParameters": {}, "body": body}, None)
+        self.assertFalse(json.loads(r["body"])["ok"])
+        self.assertEqual(self.pl.puts, [])
+        self.assertEqual(self.ses.sent, [])
 
 class BlankAdminKey(ReviewBase):
     admin_key = ""

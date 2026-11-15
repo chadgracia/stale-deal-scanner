@@ -991,10 +991,13 @@ th{background:#f6f6f6;position:sticky;top:0;}
 .bar{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center;margin:12px 0;}
 .muted{color:#888;}
 #apply{background:#1a1a1a;color:#fff;border:0;padding:8px 16px;border-radius:4px;cursor:pointer;}
+#confirmObs{background:#a00;color:#fff;border:0;padding:8px 16px;border-radius:4px;cursor:pointer;}
+#confirmObs:disabled{opacity:.6;cursor:default;}
+#obsErr{color:#a00;margin:-4px 0 10px;}
 .undo{background:none;border:0;color:#06c;text-decoration:underline;padding:0;font-size:11px;cursor:pointer;}
 </style></head><body>
 <h2 style="margin:0 0 4px;">Obsolete deals — review</h2>
-<div class="muted">Every deal stays Obsolete unless you tick it and click Apply. List fetched __FETCHED__ · <a href="__REFRESH__">Refresh list</a></div>
+<div class="muted">Tick deals, then Restore them or Confirm Obsolete to clear them from this list. List fetched __FETCHED__ · <a href="__REFRESH__">Refresh list</a></div>
 <form id="f" method="POST" action="" onsubmit="return go()">
 <input type="hidden" name="action" value="review_apply">
 <input type="hidden" name="key" value="__KEY__">
@@ -1008,8 +1011,10 @@ th{background:#f6f6f6;position:sticky;top:0;}
  <label><input type="checkbox" id="hideRev" checked> Hide deals already reviewed</label>
  <button type="button" onclick="selAll()">Select all visible</button>
  <button type="button" onclick="clr()">Clear</button>
- <button type="submit" id="apply">Apply (0)</button>
+ <button type="submit" id="apply">Restore (0)</button>
+ <button type="button" id="confirmObs" onclick="confirmObsolete()">Confirm Obsolete (0)</button>
 </div></form>
+<div id="obsErr" style="display:none"></div>
 <table><thead><tr><th></th><th>Deal</th><th>Side</th><th>Structure</th><th>Size</th><th>Price</th><th>Client</th><th>Created</th><th>Last updated</th></tr></thead>
 <tbody id="tb"></tbody></table>
 <script>
@@ -1052,7 +1057,29 @@ function render(){
 }
 function tick(el){const id=Number(el.dataset.id); if(el.checked) ticked.add(id); else ticked.delete(id); upd();}
 function picked(){return vis().filter(r=>ticked.has(r.id) && !restored(r));}
-function upd(){document.getElementById("apply").textContent="Apply ("+picked().length+")";}
+function upd(){const n=picked().length; document.getElementById("apply").textContent="Restore ("+n+")";
+  document.getElementById("confirmObs").textContent="Confirm Obsolete ("+n+")";}
+function obsErr(msg){const el=document.getElementById("obsErr"); el.textContent=msg||""; el.style.display=msg?"block":"none";}
+async function confirmObsolete(){
+  const t=picked(); if(!t.length) return;
+  const btn=document.getElementById("confirmObs"); btn.disabled=true; obsErr("");
+  try{
+    const res=await fetch(location.pathname,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},
+      body:new URLSearchParams({action:"review_apply",key:KEY,ids:"",kept:t.map(r=>r.id).join(","),ajax:"1"})});
+    let j=null; try{j=await res.json();}catch(_){}
+    if(res.ok && j && j.ok===true){
+      const at=new Date().toISOString();
+      t.forEach(r=>{r.reviewed={action:"kept",at:at}; ticked.delete(r.id);});
+      render();
+    } else {
+      obsErr("Confirm Obsolete failed: "+((j&&j.error)||("HTTP "+res.status))+". Nothing was changed.");
+    }
+  }catch(ex){
+    obsErr("Confirm Obsolete failed: "+(ex&&ex.message||ex)+". Nothing was changed.");
+  }finally{
+    btn.disabled=false;
+  }
+}
 function selAll(){vis().forEach(r=>{if(!restored(r)) ticked.add(r.id);}); render();}
 function clr(){ticked.clear(); render();}
 function go(){
@@ -1125,14 +1152,21 @@ def review_apply(params):
     key = str(params.get("key", "")).strip()
     chosen = CONFIRM_STAGE_ID if params.get("stage") == "confirm" else INQUIRY_STAGE_ID
     stage_param = "confirm" if chosen == CONFIRM_STAGE_ID else "inquiry"
-    ids = _id_list(params.get("ids"))
+    ajax = str(params.get("ajax", "")) == "1"
+    ids = [] if ajax else _id_list(params.get("ids"))
     kept_ids = [k for k in _id_list(params.get("kept")) if k not in set(ids)]
     batch, rest = ids[:REVIEW_BATCH], ids[REVIEW_BATCH:]
     now = datetime.now(timezone.utc)
     e = html.escape
 
+    def _json(body):
+        return {"statusCode": 200, "headers": {"Content-Type": "application/json", "Cache-Control": "no-store"},
+                "body": json.dumps(body)}
+
     entries, ok = load_review_log()
     if not ok:
+        if ajax:
+            return _json({"ok": False, "error": "Could not read the review log"})
         return _wide_page("Error", "<p><b>Could not read the review log.</b> Nothing was changed in Pipeline. Try again.</p>")
 
     cached = {}
@@ -1148,8 +1182,13 @@ def review_apply(params):
                         "at": now.isoformat()})
     # Log must be writable before anything is written to Pipeline.
     if not save_review_log(entries):
+        if ajax:
+            return _json({"ok": False, "error": "Could not save the review log"})
         return _wide_page("Error", "<p><b>Could not save the review log.</b> Nothing was changed in Pipeline. "
                                    "The scanner role needs s3:PutObject on full-pipeline-cache/obsolete-review/*.</p>")
+    if ajax:
+        # Confirm Obsolete: log-only. No Pipeline read/write, no email.
+        return _json({"ok": True, "kept": len(kept_ids)})
 
     jwt = get_jwt() if batch else None
     restored, skipped, failed = [], [], []

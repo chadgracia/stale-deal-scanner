@@ -33,6 +33,8 @@
   Obsolete. PUT = `deal_stage_id` (Inquiry/Confirm; Anthropic Sell → Hold) + `custom_label_4012491`
   (LAST_CONFIRMED, pre-restore updated_at as YYYY-MM-DD). Nothing else, never a client email.
   Visible unticked rows are logged as "kept". More than 50 → "Continue" re-posts the rest.
+- "Confirm Obsolete (N)" button: fetch POST `review_apply` with `ajax=1` → ids forced empty, ticked rows logged as
+  "kept" only, no Pipeline call, no email, JSON `{ok, kept}` / `{ok:false, error}`. Rows hide client-side, no reload.
 - `review_undo` (POST): only for deals the log shows as "restored"; sets stage back to Obsolete only.
 - Every decision is logged to `s3://full-pipeline-cache/obsolete-review/log.json` BEFORE the Pipeline write;
   if the log can't be saved, nothing is written. One summary email to Chad per batch.
